@@ -5,7 +5,7 @@ from sqlalchemy import update
 async def check_and_decrement_quota(user: db.User, action: str) -> tuple[bool, str]:
     now = datetime.utcnow()
     
-    # اگر last_reset None بود (کاربران قدیمی یا باگ دیتابیس)، مقداردهی کنیم
+    # 🔥 اصلاح: اگر last_reset خالی بود، مقداردهی می‌کنیم تا کرش نکند
     if user.last_reset is None:
         user.last_reset = now - timedelta(days=1)
 
@@ -15,7 +15,6 @@ async def check_and_decrement_quota(user: db.User, action: str) -> tuple[bool, s
             user.daily_reactions = 20
         user.last_reset = now
         
-        # 🔥 اصلاح: استفاده از session به جای engine.execute که در SQLAlchemy 2.0 حذف شده
         async with db.AsyncSessionLocal() as session:
             await session.execute(
                 update(db.User).where(db.User.telegram_id == user.telegram_id).values(
