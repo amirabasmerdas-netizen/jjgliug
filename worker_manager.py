@@ -1,14 +1,14 @@
-# worker_manager.py
 from aiohttp import web
 import requests
 import json
 import database as db
+import config  # 🔥 اضافه کردن ایمپورت config
 
 async def handle_worker_webhook(request: web.Request):
     token = request.match_info['token']
     
-    # بررسی امنیت (اختیاری اما توصیه شده)
-    if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != "my_secret_key": # بهتر است از config خوانده شود
+    # 🔥 اصلاح: بررسی توکن امنیتی از طریق config
+    if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != config.SECRET_TOKEN:
         return web.Response(status=401)
 
     # بررسی وجود توکن در دیتابیس
@@ -20,14 +20,13 @@ async def handle_worker_webhook(request: web.Request):
     # دریافت آپدیت از تلگرام
     update = await request.json()
     
-    # استخراج اطلاعات پیام (فقط اگر پیام در کانال باشد و ربات ادمین باشد)
+    # استخراج اطلاعات پیام (فقط اگر پیام در کانال باشد)
     if 'channel_post' in update or 'edited_channel_post' in update:
         post = update.get('channel_post') or update.get('edited_channel_post')
         chat_id = post['chat']['id']
         message_id = post['message_id']
         
         # ارسال ری‌اکشن با استفاده از توکن ربات کارگر
-        # توجه: تلگرام اجازه می‌دهد ربات‌ها ری‌اکشن ارسال کنند (نیاز به ربات پریمیوم ندارد)
         payload = {
             "chat_id": chat_id,
             "message_id": message_id,
