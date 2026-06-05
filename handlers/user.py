@@ -2,12 +2,14 @@ from aiogram import Router, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from sqlalchemy import update
+from sqlalchemy import update, select
 import config
 import database as db
 from services.quota import check_and_decrement_quota
 from services.channel import is_bot_admin_in_channel
+import logging
 
+logger = logging.getLogger(__name__)
 router = Router()
 
 class ViewState(StatesGroup):
@@ -46,14 +48,14 @@ async def cmd_start(message: types.Message):
         user.user_type = 'owner'
 
     if user.user_type == 'owner':
-        await message.answer("سلام ادمین عزیز! به پنل مدیریت خوش آمدید.", reply_markup=get_admin_menu_kb())
+        await message.answer("👑 سلام ادمین عزیز! به پنل مدیریت خوش آمدید.", reply_markup=get_admin_menu_kb())
     else:
-        await message.answer(f"سلام {message.from_user.first_name}! به ربات مدیریت کانال خوش آمدید.", reply_markup=get_main_menu_kb())
+        await message.answer(f"👋 سلام {message.from_user.first_name}! به ربات مدیریت کانال خوش آمدید.", reply_markup=get_main_menu_kb())
 
 @router.message(F.text == "پنل مدیریت ⚙️")
 async def cmd_admin_panel_redirect(message: types.Message):
     if message.from_user.id != config.OWNER_ID:
-        await message.answer("شما دسترسی به این بخش را ندارید.")
+        await message.answer("⛔️ شما دسترسی به این بخش را ندارید.")
         return
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -66,22 +68,36 @@ async def cmd_admin_panel_redirect(message: types.Message):
 # --- سیستم ویو ---
 @router.message(F.text == "ویو")
 async def cmd_view(message: types.Message, state: FSMContext):
-    user = await db.get_or_create_user(message.from_user.id)
-    allowed, msg = await check_and_decrement_quota(user, 'view')
+    logger.info(f"User {message.from_user.id} clicked 'ویو'")
+    
+    # 🔥 اصلاح: فقط telegram_id را ارسال می‌کنیم، نه شی user
+    allowed, msg = await check_and_decrement_quota(message.from_user.id, 'view')
     if not allowed:
         await message.answer(msg)
         return
     
-    await message.answer("🔹 <b>سیستم افزایش ویو</b>\n\nلطفاً آیدی کانال خود را با @ ارسال کنید (مثال: @mychannel)\n\n⚠️ توجه: ربات اصلی باید در کانال شما ادمین باشد.", parse_mode="HTML")
+    await message.answer(
+        "🔹 <b>سیستم افزایش ویو</b>\n\n"
+        "لطفاً آیدی کانال خود را با @ ارسال کنید (مثال: @mychannel)\n\n"
+        "⚠️ توجه: ربات اصلی باید در کانال شما ادمین باشد.\n\n"
+        "برای لغو، کلمه 'لغو' را ارسال کنید.", 
+        parse_mode="HTML"
+    )
     await state.set_state(ViewState.waiting_for_channel)
 
 @router.message(ViewState.waiting_for_channel)
 async def process_view_channel(message: types.Message, state: FSMContext, bot: types.Bot):
     channel_id = message.text.strip()
+    logger.info(f"User {message.from_user.id} sent channel: {channel_id}")
+    
     is_admin = await is_bot_admin_in_channel(bot, channel_id)
     
     if not is_admin:
-        await message.answer("❌ ربات در این کانال ادمین نیست. لطفاً ربات را ادمین کنید و دوباره تلاش کنید.\n\nبرای لغو، کلمه 'لغو' را ارسال کنید.")
+        await message.answer(
+            "❌ ربات در این کانال ادمین نیست.\n\n"
+            "لطفاً ربات را در کانال خود ادمین کنید و سپس دوباره آیدی کانال را ارسال کنید.\n\n"
+            "برای لغو، کلمه 'لغو' را ارسال کنید."
+        )
         return
 
     async with db.AsyncSessionLocal() as session:
@@ -92,13 +108,18 @@ async def process_view_channel(message: types.Message, state: FSMContext, bot: t
         )
         await session.commit()
 
-    await message.answer("✅ کانال با موفقیت تأیید شد!\n\nحالا یک پست تستی از کانال خود به این ربات <b>فوروارد</b> کنید تا به گروه‌های هدف ارسال شود.", parse_mode="HTML")
+    await message.answer(
+        "✅ کانال با موفقیت تأیید شد!\n\n"
+        "حالا یک پست تستی از کانال خود به این ربات <b>فوروارد</b> کنید تا به گروه‌های هدف ارسال شود.", 
+        parse_mode="HTML"
+    )
     await state.set_state(ViewState.waiting_for_post)
 
 @router.message(ViewState.waiting_for_post, F.forward_from_chat)
 async def process_test_post(message: types.Message, bot: types.Bot, state: FSMContext):
     async with db.AsyncSessionLocal() as session:
-        user = (await session.execute(db.User.__table__.select().where(db.User.telegram_id == message.from_user.id))).scalar_one()
+        result = await session.execute(select(db.User).where(db.User.telegram_id == message.from_user.id))
+        user = result.scalar_one()
         if user.user_type == 'normal':
             user.daily_views -= 1
             await session.commit()
@@ -106,10 +127,14 @@ async def process_test_post(message: types.Message, bot: types.Bot, state: FSMCo
     success_count = 0
     for group_id in config.TARGET_VIEW_GROUPS:
         try:
-            await bot.copy_message(chat_id=group_id, from_chat_id=message.forward_from_chat.id, message_id=message.forward_from_message_id)
+            await bot.copy_message(
+                chat_id=group_id, 
+                from_chat_id=message.forward_from_chat.id, 
+                message_id=message.forward_from_message_id
+            )
             success_count += 1
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error forwarding to {group_id}: {e}")
     
     await message.answer(f"✅ پست با موفقیت در {success_count} گروه هدف قرار گرفت.")
     
@@ -125,14 +150,16 @@ async def process_invalid_post(message: types.Message):
 # --- سیستم ری‌اکشن ---
 @router.message(F.text == "ری‌اکشن")
 async def cmd_reaction(message: types.Message, state: FSMContext):
-    user = await db.get_or_create_user(message.from_user.id)
-    allowed, msg = await check_and_decrement_quota(user, 'reaction')
+    logger.info(f"User {message.from_user.id} clicked 'ری‌اکشن'")
+    
+    allowed, msg = await check_and_decrement_quota(message.from_user.id, 'reaction')
     if not allowed:
         await message.answer(msg)
         return
 
     async with db.AsyncSessionLocal() as session:
-        workers = (await session.execute(db.WorkerBot.__table__.select().where(db.WorkerBot.is_active == True))).scalars().all()
+        result = await session.execute(select(db.WorkerBot).where(db.WorkerBot.is_active == True))
+        workers = result.scalars().all()
     
     if not workers:
         await message.answer("⚠️ در حال حاضر ربات ری‌اکشن‌دهنده‌ای فعال نیست. لطفاً با ادمین تماس بگیرید.")
@@ -143,7 +170,8 @@ async def cmd_reaction(message: types.Message, state: FSMContext):
     msg_text = (
         "🔹 <b>سیستم افزایش ری‌اکشن</b>\n\n"
         f"برای فعال‌سازی، ربات‌های زیر را در کانال خود <b>ادمین</b> کنید:\n\n{worker_list}\n\n"
-        "پس از ادمین کردن ربات‌ها، لطفاً <b>آیدی کانال</b> خود را با @ ارسال کنید (مثال: @mychannel)."
+        "پس از ادمین کردن ربات‌ها، لطفاً <b>آیدی کانال</b> خود را با @ ارسال کنید (مثال: @mychannel).\n\n"
+        "برای لغو، کلمه 'لغو' را ارسال کنید."
     )
     await message.answer(msg_text, parse_mode="HTML")
     await state.set_state(ReactionState.waiting_for_channel)
@@ -151,6 +179,7 @@ async def cmd_reaction(message: types.Message, state: FSMContext):
 @router.message(ReactionState.waiting_for_channel)
 async def process_reaction_channel(message: types.Message, state: FSMContext, bot: types.Bot):
     channel_id = message.text.strip()
+    logger.info(f"User {message.from_user.id} sent reaction channel: {channel_id}")
     
     async with db.AsyncSessionLocal() as session:
         await session.execute(
@@ -163,8 +192,9 @@ async def process_reaction_channel(message: types.Message, state: FSMContext, bo
     await message.answer(
         "✅ درخواست شما ثبت شد!\n\n"
         "از این به بعد، هر پستی که در کانال شما قرار بگیرد، توسط ربات‌های ری‌اکشن‌دهنده با ایموجی 🔥 ری‌اکشن دریافت می‌کند.\n\n"
-        "⚠️ <b>توجه:</b> مطمئن شوید که ربات‌های معرفی شده در کانال شما <b>ادمین</b> باشند."
-    , parse_mode="HTML")
+        "⚠️ <b>توجه:</b> مطمئن شوید که ربات‌های معرفی شده در کانال شما <b>ادمین</b> باشند.",
+        parse_mode="HTML"
+    )
     
     current_user = await db.get_or_create_user(message.from_user.id)
     kb = get_admin_menu_kb() if current_user.user_type == 'owner' else get_main_menu_kb()
