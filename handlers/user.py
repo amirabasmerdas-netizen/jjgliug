@@ -10,9 +10,12 @@ from services.channel import is_bot_admin_in_channel
 
 router = Router()
 
-class ChannelState(StatesGroup):
+class ViewState(StatesGroup):
     waiting_for_channel = State()
     waiting_for_post = State()
+
+class ReactionState(StatesGroup):
+    waiting_for_channel = State()
 
 def get_main_menu_kb() -> ReplyKeyboardMarkup:
     kb = [
@@ -34,7 +37,6 @@ def get_admin_menu_kb() -> ReplyKeyboardMarkup:
 async def cmd_start(message: types.Message):
     user = await db.get_or_create_user(message.from_user.id)
     
-    # 🔥 شناسایی مالک و به‌روزرسانی دیتابیس
     if message.from_user.id == config.OWNER_ID and user.user_type != 'owner':
         async with db.AsyncSessionLocal() as session:
             await session.execute(
@@ -61,6 +63,7 @@ async def cmd_admin_panel_redirect(message: types.Message):
     ])
     await message.answer("🛠 پنل مدیریت مالک:", reply_markup=kb)
 
+# --- سیستم ویو ---
 @router.message(F.text == "ویو")
 async def cmd_view(message: types.Message, state: FSMContext):
     user = await db.get_or_create_user(message.from_user.id)
@@ -69,16 +72,16 @@ async def cmd_view(message: types.Message, state: FSMContext):
         await message.answer(msg)
         return
     
-    await message.answer("لطفاً آیدی کانال خود را با @ ارسال کنید (مثال: @mychannel)\n\n⚠️ توجه: ربات باید در کانال شما ادمین باشد.")
-    await state.set_state(ChannelState.waiting_for_channel)
+    await message.answer("🔹 <b>سیستم افزایش ویو</b>\n\nلطفاً آیدی کانال خود را با @ ارسال کنید (مثال: @mychannel)\n\n⚠️ توجه: ربات اصلی باید در کانال شما ادمین باشد.", parse_mode="HTML")
+    await state.set_state(ViewState.waiting_for_channel)
 
-@router.message(ChannelState.waiting_for_channel)
-async def process_channel_id(message: types.Message, state: FSMContext, bot: types.Bot):
+@router.message(ViewState.waiting_for_channel)
+async def process_view_channel(message: types.Message, state: FSMContext, bot: types.Bot):
     channel_id = message.text.strip()
     is_admin = await is_bot_admin_in_channel(bot, channel_id)
     
     if not is_admin:
-        await message.answer("❌ ربات در این کانال ادمین نیست. لطفاً ربات را ادمین کنید و دوباره تلاش کنید.")
+        await message.answer("❌ ربات در این کانال ادمین نیست. لطفاً ربات را ادمین کنید و دوباره تلاش کنید.\n\nبرای لغو، کلمه 'لغو' را ارسال کنید.")
         return
 
     async with db.AsyncSessionLocal() as session:
@@ -89,33 +92,39 @@ async def process_channel_id(message: types.Message, state: FSMContext, bot: typ
         )
         await session.commit()
 
-    await message.answer("✅ کانال با موفقیت تأیید شد! حالا یک پست تستی از کانال خود به این ربات فوروارد کنید.")
-    await state.set_state(ChannelState.waiting_for_post)
+    await message.answer("✅ کانال با موفقیت تأیید شد!\n\nحالا یک پست تستی از کانال خود به این ربات <b>فوروارد</b> کنید تا به گروه‌های هدف ارسال شود.", parse_mode="HTML")
+    await state.set_state(ViewState.waiting_for_post)
 
-@router.message(ChannelState.waiting_for_post, F.forward_from_chat)
-async def process_test_post(message: types.Message, bot: types.Bot):
+@router.message(ViewState.waiting_for_post, F.forward_from_chat)
+async def process_test_post(message: types.Message, bot: types.Bot, state: FSMContext):
     async with db.AsyncSessionLocal() as session:
         user = (await session.execute(db.User.__table__.select().where(db.User.telegram_id == message.from_user.id))).scalar_one()
         if user.user_type == 'normal':
             user.daily_views -= 1
             await session.commit()
 
+    success_count = 0
     for group_id in config.TARGET_VIEW_GROUPS:
         try:
-            await bot.copy_message(chat_id=group_id, from_chat_id=message.chat.id, message_id=message.message_id)
+            await bot.copy_message(chat_id=group_id, from_chat_id=message.forward_from_chat.id, message_id=message.forward_from_message_id)
+            success_count += 1
         except Exception:
             pass
     
-    await message.answer("✅ پست با موفقیت در گروه‌های هدف قرار گرفت. سهمیه بازدید شما به‌روزرسانی شد.")
+    await message.answer(f"✅ پست با موفقیت در {success_count} گروه هدف قرار گرفت.")
     
-    # بازگشت به منوی مناسب بر اساس نوع کاربر
     current_user = await db.get_or_create_user(message.from_user.id)
     kb = get_admin_menu_kb() if current_user.user_type == 'owner' else get_main_menu_kb()
     await message.answer("منوی اصلی:", reply_markup=kb)
     await state.clear()
 
+@router.message(ViewState.waiting_for_post)
+async def process_invalid_post(message: types.Message):
+    await message.answer("❌ لطفاً یک پست را از کانال خود به این ربات <b>فوروارد</b> کنید.", parse_mode="HTML")
+
+# --- سیستم ری‌اکشن ---
 @router.message(F.text == "ری‌اکشن")
-async def cmd_reaction(message: types.Message):
+async def cmd_reaction(message: types.Message, state: FSMContext):
     user = await db.get_or_create_user(message.from_user.id)
     allowed, msg = await check_and_decrement_quota(user, 'reaction')
     if not allowed:
@@ -130,13 +139,39 @@ async def cmd_reaction(message: types.Message):
         return
 
     worker_list = "\n".join([f"🤖 @{w.bot_username}" for w in workers])
-    await message.answer(
-        f"برای فعال‌سازی ری‌اکشن، مراحل زیر را انجام دهید:\n\n"
-        f"1️⃣ آیدی کانال خود را ارسال کنید.\n"
-        f"2️⃣ ربات‌های زیر را در کانال خود ادمین کنید:\n{worker_list}\n\n"
-        f"پس از ادمین کردن، کلمه 'تأیید' را ارسال کنید."
+    
+    msg_text = (
+        "🔹 <b>سیستم افزایش ری‌اکشن</b>\n\n"
+        f"برای فعال‌سازی، ربات‌های زیر را در کانال خود <b>ادمین</b> کنید:\n\n{worker_list}\n\n"
+        "پس از ادمین کردن ربات‌ها، لطفاً <b>آیدی کانال</b> خود را با @ ارسال کنید (مثال: @mychannel)."
     )
+    await message.answer(msg_text, parse_mode="HTML")
+    await state.set_state(ReactionState.waiting_for_channel)
 
+@router.message(ReactionState.waiting_for_channel)
+async def process_reaction_channel(message: types.Message, state: FSMContext, bot: types.Bot):
+    channel_id = message.text.strip()
+    
+    async with db.AsyncSessionLocal() as session:
+        await session.execute(
+            update(db.User).where(db.User.telegram_id == message.from_user.id).values(
+                channel_id=channel_id
+            )
+        )
+        await session.commit()
+
+    await message.answer(
+        "✅ درخواست شما ثبت شد!\n\n"
+        "از این به بعد، هر پستی که در کانال شما قرار بگیرد، توسط ربات‌های ری‌اکشن‌دهنده با ایموجی 🔥 ری‌اکشن دریافت می‌کند.\n\n"
+        "⚠️ <b>توجه:</b> مطمئن شوید که ربات‌های معرفی شده در کانال شما <b>ادمین</b> باشند."
+    , parse_mode="HTML")
+    
+    current_user = await db.get_or_create_user(message.from_user.id)
+    kb = get_admin_menu_kb() if current_user.user_type == 'owner' else get_main_menu_kb()
+    await message.answer("منوی اصلی:", reply_markup=kb)
+    await state.clear()
+
+# --- سایر دکمه‌ها ---
 @router.message(F.text == "ارتباط با ادمین")
 async def cmd_contact_admin(message: types.Message):
     try:
@@ -150,8 +185,8 @@ async def cmd_contact_admin(message: types.Message):
 async def cmd_help(message: types.Message):
     help_text = (
         "📖 <b>راهنمای استفاده از ربات:</b>\n\n"
-        "🔹 <b>ویو:</b> افزایش بازدید پست‌های کانال شما.\n"
-        "🔹 <b>ری‌اکشن:</b> افزایش ری‌اکشن پست‌های کانال شما.\n"
+        "🔹 <b>ویو:</b> افزایش بازدید پست‌های کانال شما (با فوروارد به گروه‌های هدف).\n"
+        "🔹 <b>ری‌اکشن:</b> افزایش ری‌اکشن پست‌های کانال شما (با ایموجی 🔥).\n"
         "🔹 <b>خرید / تمدید پرو:</b> مشاهده اطلاعات خرید اشتراک ویژه.\n\n"
         "⚠️ <b>توجه:</b> کاربران عادی روزانه ۲۰ بازدید و ۲۰ ری‌اکشن رایگان دارند.\n"
         "برای دسترسی نامحدود، اشتراک پرو تهیه کنید."
@@ -172,3 +207,13 @@ async def cmd_buy_pro(message: types.Message):
         f"👤 آیدی ادمین: {admin_link}\n\n"
         f"پس از پرداخت، ادمین اشتراک شما را فعال خواهد کرد."
     )
+
+@router.message(F.text == "لغو")
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        return
+    await state.clear()
+    current_user = await db.get_or_create_user(message.from_user.id)
+    kb = get_admin_menu_kb() if current_user.user_type == 'owner' else get_main_menu_kb()
+    await message.answer("❌ عملیات لغو شد.", reply_markup=kb)
